@@ -1,124 +1,201 @@
-# importing required libraries
-import torch.nn as nn
-import torch
-import torch.nn.functional as F
-import math,copy,re
-import warnings
-import pandas as pd
+import os
 import numpy as np
-import seaborn as sns
-import torchtext
+import random
+import math
+import json
+from functools import partial
+
+## Imports for plotting
 import matplotlib.pyplot as plt
-warnings.simplefilter("ignore")
-print(torch.__version__)
+plt.set_cmap('cividis')
+%matplotlib inline
+from IPython.display import set_matplotlib_formats
+set_matplotlib_formats('svg', 'pdf') # For export
+from matplotlib.colors import to_rgb
+import matplotlib
+matplotlib.rcParams['lines.linewidth'] = 2.0
+import seaborn as sns
+sns.reset_orig()
+
+## tqdm for loading bars
+from tqdm.notebook import tqdm
+
+## PyTorch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data as data
+import torch.optim as optim
+
+## Torchvision
+import torchvision
+from torchvision.datasets import CIFAR100
+from torchvision import transforms
 
 
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
-class Embedding(nn.Module):
+# Setting the seed
+pl.seed_everything(42)
 
-    def __init__(self,vocab_size,embed_dim):
+# Ensure that all operations are deterministic on GPU (if used) for reproducibility
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
-        super(Embedding,self).__init__()
-        self.embed = nn.Embedding(vocab_size,embed_dim)
+device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+print("Device:", device)
 
-    def forward(self,x):
+        
 
-        return self.embed(x)
+def scaled_dot_product(q, k, v, mask=None):
+    d_k = q.size()[-1]
+    attn_logits = torch.matmul(q, k.transpose(-2, -1))
+    attn_logits = attn_logits / math.sqrt(d_k)
+    if mask is not None:
+        attn_logits = attn_logits.masked_fill(mask == 0, -9e15)
+    attention = F.softmax(attn_logits, dim=-1)
+    values = torch.matmul(attention, v)
+    return values, attention
 
-
-class PositionnalEmbedding(nn.Module):
-
-    def __init__(self,max_seq_len,embed_model_dim):
-
-        super(PositionnalEmbedding,self).__init__()
-
-
-        self.embed_dim = embed_model_dim
-        pe = torch.zeros((max_seq_len,self.embed_dim))
-
-        for pos in range(max_seq_len):
-            for i in range(0,self.embed_dim,2):
-
-                pe[pos][i] = np.sin( pos / (1000 ** (i/self.embed_dim)))
-                pe[pos][i+1] = np.sin( pos / (1000 ** ((i+1)/self.embed_dim)))
-
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
-
-    def forward(self,x):
-
-        x = x * math.sqrt(self.embed_dim)
-        seq_len = x.size(1)
-        x = x + torch.autograd.Variable(self.pe[:,:seq_len], requires_grad=False)
-        return x
 
 
 class MultiHeadAttention(nn.Module):
 
-    def __init__(self,embed_dim = 512, n_heads = 8):
+    def __init__(self,input_dim,embed_dim,num_heads):
 
         super(MultiHeadAttention,self).__init__()
 
-        self.embed_dim = embed_dim    
-        self.n_heads = n_heads   
-        self.single_head_dim = int(self.embed_dim / self.n_heads)
+        assert embed_dim % num_heads == 0
 
-        self.query_matrix = nn.Linear(self.single_head_dim,self.single_head_dim,bias=False)
-        self.key_matrix = nn.Linear(self.single_head_dim,self.single_head_dim,bias=False)
-        self.value_matrix = nn.Linear(self.single_head_dim,self.single_head_dim,bias=False)
-  
+        self.embed_dim = embed_dim
+        self.input_dim = input_dim
+        self.head_dim = embed_dim // num_heads
 
-        self.output = nn.Linear(embed_dim,embed_dim)
 
-    def forward(self,key,query,value,mask=None):    #batch_size x sequence_length x embedding_dim    # 32 x 10 x 512
+        self.qkv_proj = nn.Linear(input_dim, 3*embed_dim)
+        self.o_proj = nn.Linear(embed_dim, embed_dim)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+
+        # Original Transformer initialization, see PyTorch documentation
+        nn.init.xavier_uniform_(self.qkv_proj.weight)
+        self.qkv_proj.bias.data.fill_(0)
+        nn.init.xavier_uniform_(self.o_proj.weight)
+        self.o_proj.bias.data.fill_(0)
+
+    def forward(self, x, mask=None, return_attention=False):
+
+        batch_size, seq_length, _ = x.size()
+        qkv = self.qkv_proj(x)
+
+        # Separate Q, K, V from linear output
+        qkv = qkv.reshape(batch_size, seq_length, self.num_heads, 3*self.head_dim)
+        qkv = qkv.permute(0, 2, 1, 3) # [Batch, Head, SeqLen, Dims]
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Determine value outputs
+        values, attention = scaled_dot_product(q, k, v, mask=mask)
+        values = values.permute(0, 2, 1, 3) # [Batch, SeqLen, Head, Dims]
+        values = values.reshape(batch_size, seq_length, self.embed_dim)
+        o = self.o_proj(values)
+
+        if return_attention:
+            return o, attention
+        else:
+            return o
+
+class EncoderBlock(nn.Module):
+
+    def __init__(self, input_dim, num_heads, dim_feedforward, dropout=0.0):
+        """
+        Inputs:
+            input_dim - Dimensionality of the input
+            num_heads - Number of heads to use in the attention block
+            dim_feedforward - Dimensionality of the hidden layer in the MLP
+            dropout - Dropout probability to use in the dropout layers
+        """
+        super(EncoderBlock,self).__init__()
+
+        self.multi_head = MultiHeadAttention(input_dim,input_dim,num_heads)
+
+        self.FNN = nn.Sequential(
+                                nn.Linear(input_dim,dim_feedforward),
+                                nn.Dropout(dropout),
+                                nn.ReLU(inplace=True),
+                                nn.Linear(dim_feedforward,input_dim)
+        )
+
+        self.norm1 = nn.LayerNorm(input_dim)
+        self.norm2 = nn.LayerNorm(input_dim)
+        self.dropout = nn.Dropout(dropout)
+
+
+    def forward(self,x,mask = None):
+
+        out_multi = self.multi_head(x,mask)
+        out_multi_norm = self.norm1(self.dropout(out_multi) + x)
+
+        out_ffn = self.FNN(out_multi_norm)
+        out_ffn_norm = self.norm2(self.dropout(out_ffn) + out_multi_norm)
+
+        return out_ffn_norm
+
+class TransformerEncoder(nn.Module):
+
+    def __init__(self, num_layers, **block_args):
+        super().__init__()
+        self.layers = nn.ModuleList([EncoderBlock(**block_args) for _ in range(num_layers)])
+
+    def forward(self, x, mask=None):
+        for l in self.layers:
+            x = l(x, mask=mask)
+        return x
+
+    def get_attention_maps(self, x, mask=None):
+        attention_maps = []
+        for l in self.layers:
+            _, attn_map = l.self_attn(x, mask=mask, return_attention=True)
+            attention_maps.append(attn_map)
+            x = l(x)
+        return attention_maps
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model, max_len=5000):
+        """
+        Inputs
+            d_model - Hidden dimensionality of the input.
+            max_len - Maximum length of a sequence to expect.
+        """
+        super(PositionalEncoding,self).__init__()
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+
+        # register_buffer => Tensor which is not a parameter, but should be part of the modules state.
+        # Used for tensors that need to be on the same device as the module.
+        # persistent=False tells PyTorch to not add the buffer to the state dict (e.g. when we save the model)
+        self.register_buffer('pe', pe, persistent=False)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return x
+
+
+
+
+
+
+
         
-        batch_size = key.size(0)
-        seq_length = key.size(1)
-
-        seq_length_query = query.size(1)
-        
-        key = key.view(batch_size, seq_length, self.n_heads, self.single_head_dim)  #batch_size x sequence_length x n_heads x single_head_dim = (32x10x8x64)
-        query = query.view(batch_size, seq_length_query, self.n_heads, self.single_head_dim) #(32x10x8x64)
-        value = value.view(batch_size, seq_length, self.n_heads, self.single_head_dim) #(32x10x8x64)
-       
-        k = self.key_matrix(key)       # (32x10x8x64)
-        q = self.query_matrix(query)   
-        v = self.value_matrix(value)
-
-        q = q.transpose(1,2)  # (batch_size, n_heads, seq_len, single_head_dim)    # (32 x 8 x 10 x 64)
-        k = k.transpose(1,2)  # (batch_size, n_heads, seq_len, single_head_dim)
-        v = v.transpose(1,2)  # (batch_size, n_heads, seq_len, single_head_dim)
-       
-        # computes attention
-        # adjust key for matrix multiplication
-        k_adjusted = k.transpose(-1,-2)  #(batch_size, n_heads, single_head_dim, seq_ken)  #(32 x 8 x 64 x 10)
-        product = torch.matmul(q, k_adjusted)  #(32 x 8 x 10 x 64) x (32 x 8 x 64 x 10) = #(32x8x10x10)
-      
-        
-        # fill those positions of product matrix as (-1e20) where mask positions are 0
-        if mask is not None:
-             product = product.masked_fill(mask == 0, float("-1e20"))
-
-        #divising by square root of key dimension
-        product = product / math.sqrt(self.single_head_dim) # / sqrt(64)
-
-        #applying softmax
-        scores = F.softmax(product, dim=-1)
- 
-        #mutiply with value matrix
-        scores = torch.matmul(scores, v)  ##(32x8x 10x 10) x (32 x 8 x 10 x 64) = (32 x 8 x 10 x 64) 
-        
-        #concatenated output
-        concat = scores.transpose(1,2).contiguous().view(batch_size, seq_length_query, self.single_head_dim*self.n_heads)  # (32x8x10x64) -> (32x10x8x64)  -> (32,10,512)
-        
-        output = self.output(concat) #(32,10,512) -> (32,10,512)
-       
-        return output
-
-
 
         
-
-
 
 
