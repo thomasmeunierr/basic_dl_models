@@ -29,15 +29,21 @@ class PositionnalEncoding(nn.Module):
 
 class MultiHeadAttention(nn.Module):
 
-    def __init__(self,n_r,n_k,d_k,d_v,**kwargs):
+    def __init__(self,input_dim,embed_dim,num_heads,**kwargs):
 
         super(MultiHeadAttention,self).__init__()
 
-        self.Q = nn.Linear(n_r,d_k)
-        self.K = nn.Linear(n_k,d_k)
-        self.V = nn.Linear(n_k,d_k)
+        assert embed_dim % num_heads == 0
 
-        self.dk = d_k
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        self.Q = nn.Linear(input_dim,embed_dim)
+        self.K = nn.Linear(input_dim,embed_dim)
+        self.V = nn.Linear(input_dim,embed_dim)
+
+        self.embed_dim = embed_dim
 
     def forward(self,q,k,v):
 
@@ -45,8 +51,5 @@ class MultiHeadAttention(nn.Module):
         K_mat = nn.functional.relu(self.K(k))
         V_mat = nn.functional.relu(self.V(v))
 
-        return torch.matmul(
-                            nn.functional.softmax(
-                                                torch.matmul(Q_mat,torch.transpose(K_mat)) / torch.sqrt(self.dk)),
-                                                V_mat)
+        return torch.matmul(nn.functional.softmax(torch.matmul(Q_mat,torch.transpose(K_mat,-2,-1)) / np.sqrt(self.embed_dim)),V_mat)
 
