@@ -89,31 +89,3 @@ class ResNet34(nn.Module):
         return self.final_layers(out)
 
 
-class ResNet34(nn.Module):
-    def __init__(self):
-        super(ResNet34, self).__init__()
-        self.first_layers = nn.Sequential(
-            nn.Conv2d(3, 64, 7, 2, "same"), nn.MaxPool2d(3, 2, "same")
-        )
-        layers = []
-        for _ in range(3):
-            layers.append(ResNetUnit(64, 64))
-        layers.append(ResNetUnit(64, 128, 3, 2))
-        for _ in range(4):
-            layers.append(ResNetUnit(128, 128))
-        layers.append(ResNetUnit(128, 256, 3, 2))
-        for _ in range(6):
-            layers.append(ResNetUnit(256, 256))
-        layers.append(ResNetUnit(256, 512, 3, 2))
-        for _ in range(3):
-            layers.append(ResNetUnit(512, 512))
-        layers.append(ResNetUnit(512, 1024, 3, 2))
-        self.deep_layers = nn.Sequential(*layers)
-        self.final_layers = nn.Sequential(
-            nn.AvgPool2d(), nn.Flatten(), nn.Linear(1024 * 7 * 7, 10), nn.Softmax()
-        )
-
-    def forward(self, x):
-        out = self.first_layers(x)
-        out = self.deep_layers(out)
-        return self.final_layers(out)
