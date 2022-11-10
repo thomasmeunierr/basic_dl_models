@@ -154,3 +154,4 @@ class Transformer(nn.Module):
         out_decod = self.decoder(x, out_encod)
 
         return self.out_layer(out_decod)
+        
